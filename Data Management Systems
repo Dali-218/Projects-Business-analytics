@@ -1,0 +1,503 @@
+import os
+import glob
+import pickle
+import psycopg2
+from psycopg2.extras import execute_values
+import json
+import re
+from datetime import datetime   
+
+DB_HOST = "localhost"   
+DB_NAME = "smm695"   
+DB_USER = "postgres"   
+DB_PASS = "27091996"  
+
+# Define the path to your pickle file
+PICKLE_FILE = r"C:\Bayes Business School\Database Management System\dao-data-smm695\dao-data-smm695\snap-data-collection\.data\snap_dao_info.pickle"
+
+# Load data from the pickle file
+with open(PICKLE_FILE, 'rb') as file:
+    dao_data = pickle.load(file)
+
+# Assuming the actual key is 'data' instead of 'spaces'
+dao_list = dao_data.get('data', {}).get('spaces', [])
+
+# Connect to your PostgreSQL database
+conn = psycopg2.connect(
+    host=DB_HOST,
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASS 
+)
+cursor = conn.cursor()
+
+# Insert DAO data
+for dao in dao_list:
+    cursor.execute("""
+        INSERT INTO dao.DAOs (dao_id, name, rank, github, twitter, website, about, network, min_score, only_members, symbol, votes_count, active_proposals, proposals_count, members, admins, proposals_count_7d)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,%s, %s, %s, %s, %s) RETURNING dao_id
+    """, (
+        dao['id'],
+        dao['name'],
+        dao['rank'],
+        dao.get('github'),
+        dao.get('twitter'),
+        dao.get('website'),
+        dao.get('about'),
+        dao['network'],
+        dao['filters']['minScore'],
+        dao['filters']['onlyMembers'],
+        dao['symbol'],
+        dao['votesCount'],
+        dao['activeProposals'],
+        dao['proposalsCount'],
+        json.dumps(dao.get('members')),
+        json.dumps(dao.get('admins')),
+        dao['proposalsCount7d']
+    ))
+
+    # Fetch the dao_id of the newly inserted row
+    dao_id = cursor.fetchone()[0]
+
+    # Insert strategies data using the fetched dao_id
+    for strategy in dao['strategies']:
+        cursor.execute("""
+            INSERT INTO dao.Strategies (dao_id, name, symbol, decimals, additional_params)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            dao_id,
+            strategy['name'],
+            strategy['params'].get('symbol'),
+            strategy['params'].get('decimals'),
+            json.dumps(strategy.get('params'))
+        ))
+
+# Commit the transaction
+conn.commit()
+
+# Close the connection
+cursor.close()
+conn.close()
+
+FOLDER_PATH = r"C:\Bayes Business School\Database Management System\dao-data-smm695\dao-data-smm695\snap-data-collection\.data\proposals"
+
+def clean_text(text):
+    text = re.sub(r'---\n', '', text)
+    text = text.replace('\n', ' ')
+    text = text.strip()
+    return text
+
+def process_folder(folder_path, cursor):
+
+    # Initialize choice_id to start from 2888 or your desired starting value
+    current_choice_id = 1
+
+    for pickle_file in glob.glob(os.path.join(folder_path, 'snap_proposals_*.pickle')):
+        with open(pickle_file, 'rb') as file:
+            data = pickle.load(file)
+            proposals = data.get('data', {}).get('proposals', [])
+            
+            for proposal in proposals:
+                cleaned_body = clean_text(proposal['body'])
+                body_json = json.dumps(cleaned_body)
+
+                cursor.execute("""
+                    INSERT INTO dao.proposals (
+                        proposal_id, dao_id, title, body, start_time, end_time, snapshot, state, author, created_time, 
+                        scores_total, scores_updated_time
+                    )
+                    VALUES (
+                        %s, 
+                        (SELECT dao_id FROM dao.DAOs WHERE name = %s), 
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                """, (
+                    proposal['id'],
+                    proposal['space']['name'],  
+                    proposal['title'],
+                    body_json,
+                    datetime.fromtimestamp(proposal['start']),
+                    datetime.fromtimestamp(proposal['end']),
+                    proposal['snapshot'],
+                    proposal['state'],
+                    proposal['author'],
+                    datetime.fromtimestamp(proposal['created']),
+                    proposal['scores_total'],
+                    datetime.fromtimestamp(proposal['scores_updated'])
+                ))
+                
+                for idx, choice_text in enumerate(proposal['choices']):
+                    cursor.execute("""
+                        INSERT INTO dao.choices (
+                            choice_id, proposal_id, choice_text
+                        )
+                        VALUES (%s, %s, %s)
+                    """, (current_choice_id, proposal['id'], choice_text))
+                    
+                    # Manually increment the choice_id for the next entry
+                    choice_id = current_choice_id
+                    current_choice_id += 1
+                    
+                    for score in proposal['scores'][idx:idx+1]:
+                        cursor.execute("""
+                            INSERT INTO dao.scores (
+                                proposal_id, choice_id, scores_text
+                            )
+                            VALUES (%s, %s, %s)
+                        """, (proposal['id'], choice_id, score))
+
+# Connect to your PostgreSQL database
+conn = psycopg2.connect(
+    host=DB_HOST,
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASS 
+)
+cursor = conn.cursor()
+
+# Process the folder and import proposal and choices data
+process_folder(FOLDER_PATH, cursor)
+
+# Commit the transaction
+conn.commit()
+
+# Close the connection
+cursor.close()
+conn.close()
+
+# Path to folder containing follow pickle files
+FOLLOW_FOLDER = r"C:\Bayes Business School\Database Management System\dao-data-smm695\dao-data-smm695\snap-data-collection\.data\follow"
+
+def process_folder(folder_path, cursor):
+    for pickle_file in glob.glob(os.path.join(folder_path, 'snap_follow_*.pickle')):
+        with open(pickle_file, 'rb') as file:
+            data = pickle.load(file)
+            follows = data.get('data', {}).get('follows', [])
+            
+            for follow in follows:
+                # Ensure dao_id is stripped of leading/trailing whitespace
+                dao_id = follow['space']['id'].strip()
+                
+                # Check if dao_id exists in dao.DAOs
+                cursor.execute("SELECT 1 FROM dao.DAOs WHERE dao_id = %s", (dao_id,))
+                if cursor.fetchone() is None:
+                    # Insert dao_id and additional info into dao.daos_unknown if it does not exist
+                    cursor.execute("""
+                        INSERT INTO dao.daos_unknown (
+                            dao_id_unk, follow_id, follower, ipfs, network, created_time
+                        ) 
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        dao_id,
+                        follow['id'],
+                        follow['follower'],
+                        follow['ipfs'],
+                        follow['network'],
+                        datetime.fromtimestamp(follow['created'])
+                    ))
+                else:
+                    # Insert follow record only if dao_id exists in dao.DAOs
+                    cursor.execute("""
+                        INSERT INTO dao.follow (
+                            follow_id, dao_id, follower, ipfs, network, created_time
+                        ) 
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (follow_id) DO NOTHING
+                    """,
+                    (
+                        follow['id'],
+                        dao_id,
+                        follow['follower'],
+                        follow['ipfs'],
+                        follow['network'],
+                        datetime.fromtimestamp(follow['created'])
+                    ))
+
+# Connect to your PostgreSQL database
+conn = psycopg2.connect(
+    host=DB_HOST,
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASS 
+)
+cursor = conn.cursor()
+
+# Process the folder and import proposal and choices data
+process_folder(FOLLOW_FOLDER, cursor)
+
+# Commit the transaction
+conn.commit()
+
+# Close the connection
+cursor.close()
+conn.close()
+
+VOTES_FOLDER = r"C:\Bayes Business School\Database Management System\dao-data-smm695\dao-data-smm695\snap-data-collection\.data\votes"
+
+def normalize_choice(choice):
+    # Normalize choice to handle both integer and dictionary types
+    if isinstance(choice, dict):
+        return json.dumps(choice)
+    elif isinstance(choice, int):
+        return json.dumps({"choice": choice})
+    return json.dumps({"choice": choice})  # Default conversion
+
+def process_folder(VOTES_FOLDER, cursor):
+    for pickle_file in glob.glob(os.path.join(VOTES_FOLDER, 'snap_votes_*.pickle')):
+        with open(pickle_file, 'rb') as file:
+            data = pickle.load(file)
+            votes = data.get('data', {}).get('votes', [])
+
+            for vote in votes:
+                choice_normalized = normalize_choice(vote['choice'])
+                # Ensure dao_id is stripped of leading/trailing whitespace
+                dao_id = vote['space']['id'].strip()
+                cursor.execute("""
+                    INSERT INTO dao.votes (
+                        proposal_id, dao_id, voter, vp, vp_by_strategy, vp_state, created_time, choice
+                    ) 
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                """,
+                (
+                    vote['proposal']['id'],  # Function to map proposal ID to proposal_id in DB
+                    dao_id,               
+                    vote['voter'],
+                    vote['vp'],
+                    json.dumps(vote['vp_by_strategy']),
+                    vote['vp_state'],
+                    datetime.fromtimestamp(vote['created']),
+                    choice_normalized
+                ))
+
+# Connect to your PostgreSQL database
+conn = psycopg2.connect(
+    host=DB_HOST,
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASS 
+)
+cursor = conn.cursor()
+
+# Process the folder and import proposal and choices data
+process_folder(VOTES_FOLDER, cursor)
+
+# Commit the transaction
+conn.commit()
+
+# Close the connection
+cursor.close()
+conn.close()
+
+def process_folder(data_folder, cursor):
+    for pickle_file in glob.glob(os.path.join(data_folder, '*.pickle')):
+        with open(pickle_file, 'rb') as file:
+            data = pickle.load(file)
+            parse_and_insert(data, cursor)
+            
+            # Insert address data directly
+            cursor.execute("""
+                INSERT INTO dao.Addresses (address, current_balance)
+                VALUES (%s, %s)
+                ON CONFLICT (address) DO NOTHING
+            """, (data['address'].lower(), data['current_balance']))
+
+def parse_and_insert(data, cursor):
+    def safe_convert(value, conversion_func=str):
+        return conversion_func(value) if value else None
+
+    for transfer in data.get("erc_20_token_transfer", []):
+        transfer["timeStamp"] = datetime.fromtimestamp(int(transfer["timeStamp"]))
+        transfer["from_address"] = transfer.pop("from")
+        transfer["to_address"] = transfer.pop("to")
+        cursor.execute("""
+            INSERT INTO dao.erc_20_token_transfer (blockNumber, timeStamp, hash, nonce, blockHash, from_address, contractAddress, to_address, value, tokenName, tokenSymbol, tokenDecimal, transactionIndex, gas, gasPrice, gasUsed, cumulativeGasUsed, input, confirmations)
+            VALUES (%(blockNumber)s, %(timeStamp)s, %(hash)s, %(nonce)s, %(blockHash)s, %(from_address)s, %(contractAddress)s, %(to_address)s, %(value)s, %(tokenName)s, %(tokenSymbol)s, %(tokenDecimal)s, %(transactionIndex)s, %(gas)s, %(gasPrice)s, %(gasUsed)s, %(cumulativeGasUsed)s, %(input)s, %(confirmations)s)
+            ON CONFLICT (hash) DO NOTHING
+        """, {**transfer, "nonce": safe_convert(transfer["nonce"], int), "value": safe_convert(transfer["value"], float), "transactionIndex": safe_convert(transfer["transactionIndex"], int), "gas": safe_convert(transfer["gas"], int), "gasPrice": safe_convert(transfer["gasPrice"], int), "gasUsed": safe_convert(transfer["gasUsed"], int), "cumulativeGasUsed": safe_convert(transfer["cumulativeGasUsed"], int), "confirmations": safe_convert(transfer["confirmations"], int)})
+
+    for transfer in data.get("erc721_token_transfer", []):
+        transfer["timeStamp"] = datetime.fromtimestamp(int(transfer["timeStamp"]))
+        transfer["from_address"] = transfer.pop("from")
+        transfer["to_address"] = transfer.pop("to")
+        cursor.execute("""
+            INSERT INTO dao.erc721_token_transfer (blockNumber, timeStamp, hash, nonce, blockHash, from_address, contractAddress, to_address, tokenID, tokenName, tokenSymbol, tokenDecimal, transactionIndex, gas, gasPrice, gasUsed, cumulativeGasUsed, input, confirmations)
+            VALUES (%(blockNumber)s, %(timeStamp)s, %(hash)s, %(nonce)s, %(blockHash)s, %(from_address)s, %(contractAddress)s, %(to_address)s, %(tokenID)s, %(tokenName)s, %(tokenSymbol)s, %(tokenDecimal)s, %(transactionIndex)s, %(gas)s, %(gasPrice)s, %(gasUsed)s, %(cumulativeGasUsed)s, %(input)s, %(confirmations)s)
+            ON CONFLICT (hash) DO NOTHING
+        """, {**transfer, "nonce": safe_convert(transfer["nonce"], int), "tokenID": safe_convert(transfer["tokenID"], float), "transactionIndex": safe_convert(transfer["transactionIndex"], int), "gas": safe_convert(transfer["gas"], int), "gasPrice": safe_convert(transfer["gasPrice"], int), "gasUsed": safe_convert(transfer["gasUsed"], int), "cumulativeGasUsed": safe_convert(transfer["cumulativeGasUsed"], int), "confirmations": safe_convert(transfer["confirmations"], int)})
+
+    for transaction in data.get("transactons", []):
+        transaction["timeStamp"] = datetime.fromtimestamp(int(transaction["timeStamp"]))
+        transaction["from_address"] = transaction.pop("from")
+        transaction["to_address"] = transaction.pop("to")
+        cursor.execute("""
+            INSERT INTO dao.transactions (blockNumber, timeStamp, hash, nonce, blockHash, transactionIndex, from_address, to_address, value, gas, gasPrice, isError, txreceipt_status, input, cumulativeGasUsed, gasUsed, confirmations, methodId, functionName)
+            VALUES (%(blockNumber)s, %(timeStamp)s, %(hash)s, %(nonce)s, %(blockHash)s, %(transactionIndex)s, %(from_address)s, %(to_address)s, %(value)s, %(gas)s, %(gasPrice)s, %(isError)s, %(txreceipt_status)s, %(input)s, %(cumulativeGasUsed)s, %(gasUsed)s, %(confirmations)s, %(methodId)s, %(functionName)s)
+            ON CONFLICT (hash) DO NOTHING
+        """, {**transaction, "nonce": safe_convert(transaction["nonce"], int), "transactionIndex": safe_convert(transaction["transactionIndex"], int), "value": safe_convert(transaction["value"], float), "gas": safe_convert(transaction["gas"], int), "gasPrice": safe_convert(transaction["gasPrice"], int), "isError": safe_convert(transaction["isError"], int), "txreceipt_status": safe_convert(transaction["txreceipt_status"], int), "cumulativeGasUsed": safe_convert(transaction["cumulativeGasUsed"], int), "gasUsed": safe_convert(transaction["gasUsed"], int), "confirmations": safe_convert(transaction["confirmations"], int)})
+
+# Connect to your PostgreSQL database
+conn = psycopg2.connect(
+    host=DB_HOST,
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASS 
+)
+cursor = conn.cursor()
+
+# Define the folder containing the pickle files
+ETHERSCAN_FOLDER = 'C:\\Bayes Business School\\Database Management System\\dao-data-smm695\\dao-data-smm695\\etherscan-data-collection\\.data'
+
+# Process the folder and import data
+process_folder(ETHERSCAN_FOLDER, cursor)
+
+# Commit the transaction
+conn.commit()
+
+# Close the connection
+cursor.close()
+conn.close()
+
+def process_folder(data_folder, cursor):
+    for pickle_file in glob.glob(os.path.join(data_folder, '*.pickle')):
+        print(f"Processing file: {pickle_file}")  # Debugging statement
+        with open(pickle_file, 'rb') as file:
+            data = pickle.load(file)
+            parse_and_insert(data, cursor)
+            
+            # Insert address data directly
+            cursor.execute("""
+                INSERT INTO dao.Addresses (address, current_balance)
+                VALUES (%s, %s)
+                ON CONFLICT (address) DO NOTHING
+            """, (data['address'].lower(), data['current_balance']))
+
+def parse_and_insert(data, cursor):
+    def safe_convert(value, conversion_func=str):
+        return conversion_func(value) if value else None
+
+    for transfer in data.get("erc_20_token_transfer", []):
+        transfer["timeStamp"] = datetime.fromtimestamp(int(transfer["timeStamp"]))
+        transfer["from_address"] = transfer.pop("from")
+        transfer["to_address"] = transfer.pop("to")
+        cursor.execute("""
+            INSERT INTO dao.erc_20_token_transfer (blockNumber, timeStamp, hash, nonce, blockHash, from_address, contractAddress, to_address, value, tokenName, tokenSymbol, tokenDecimal, transactionIndex, gas, gasPrice, gasUsed, cumulativeGasUsed, input, confirmations)
+            VALUES (%(blockNumber)s, %(timeStamp)s, %(hash)s, %(nonce)s, %(blockHash)s, %(from_address)s, %(contractAddress)s, %(to_address)s, %(value)s, %(tokenName)s, %(tokenSymbol)s, %(tokenDecimal)s, %(transactionIndex)s, %(gas)s, %(gasPrice)s, %(gasUsed)s, %(cumulativeGasUsed)s, %(input)s, %(confirmations)s)
+            ON CONFLICT (hash) DO NOTHING
+        """, {**transfer, "nonce": safe_convert(transfer["nonce"], int), "value": safe_convert(transfer["value"], float), "transactionIndex": safe_convert(transfer["transactionIndex"], int), "gas": safe_convert(transfer["gas"], int), "gasPrice": safe_convert(transfer["gasPrice"], int), "gasUsed": safe_convert(transfer["gasUsed"], int), "cumulativeGasUsed": safe_convert(transfer["cumulativeGasUsed"], int), "confirmations": safe_convert(transfer["confirmations"], int)})
+
+    for transfer in data.get("erc721_token_transfer", []):
+        transfer["timeStamp"] = datetime.fromtimestamp(int(transfer["timeStamp"]))
+        transfer["from_address"] = transfer.pop("from")
+        transfer["to_address"] = transfer.pop("to")
+        cursor.execute("""
+            INSERT INTO dao.erc721_token_transfer (blockNumber, timeStamp, hash, nonce, blockHash, from_address, contractAddress, to_address, tokenID, tokenName, tokenSymbol, tokenDecimal, transactionIndex, gas, gasPrice, gasUsed, cumulativeGasUsed, input, confirmations)
+            VALUES (%(blockNumber)s, %(timeStamp)s, %(hash)s, %(nonce)s, %(blockHash)s, %(from_address)s, %(contractAddress)s, %(to_address)s, %(tokenID)s, %(tokenName)s, %(tokenSymbol)s, %(tokenDecimal)s, %(transactionIndex)s, %(gas)s, %(gasPrice)s, %(gasUsed)s, %(cumulativeGasUsed)s, %(input)s, %(confirmations)s)
+            ON CONFLICT (hash) DO NOTHING
+        """, {**transfer, "nonce": safe_convert(transfer["nonce"], int), "tokenID": safe_convert(transfer["tokenID"], float), "transactionIndex": safe_convert(transfer["transactionIndex"], int), "gas": safe_convert(transfer["gas"], int), "gasPrice": safe_convert(transfer["gasPrice"], int), "gasUsed": safe_convert(transfer["gasUsed"], int), "cumulativeGasUsed": safe_convert(transfer["cumulativeGasUsed"], int), "confirmations": safe_convert(transfer["confirmations"], int)})
+
+    for transaction in data.get("transactons", []):
+        transaction["timeStamp"] = datetime.fromtimestamp(int(transaction["timeStamp"]))
+        transaction["from_address"] = transaction.pop("from")
+        transaction["to_address"] = transaction.pop("to")
+        cursor.execute("""
+            INSERT INTO dao.transactions (blockNumber, timeStamp, hash, nonce, blockHash, transactionIndex, from_address, to_address, value, gas, gasPrice, isError, txreceipt_status, input, cumulativeGasUsed, gasUsed, confirmations, methodId, functionName)
+            VALUES (%(blockNumber)s, %(timeStamp)s, %(hash)s, %(nonce)s, %(blockHash)s, %(transactionIndex)s, %(from_address)s, %(to_address)s, %(value)s, %(gas)s, %(gasPrice)s, %(isError)s, %(txreceipt_status)s, %(input)s, %(cumulativeGasUsed)s, %(gasUsed)s, %(confirmations)s, %(methodId)s, %(functionName)s)
+            ON CONFLICT (hash) DO NOTHING
+        """, {**transaction, "nonce": safe_convert(transaction["nonce"], int), "transactionIndex": safe_convert(transaction["transactionIndex"], int), "value": safe_convert(transaction["value"], float), "gas": safe_convert(transaction["gas"], int), "gasPrice": safe_convert(transaction["gasPrice"], int), "isError": safe_convert(transaction["isError"], int), "txreceipt_status": safe_convert(transaction["txreceipt_status"], int), "cumulativeGasUsed": safe_convert(transaction["cumulativeGasUsed"], int), "gasUsed": safe_convert(transaction["gasUsed"], int), "confirmations": safe_convert(transaction["confirmations"], int)})
+
+# Connect to your PostgreSQL database
+conn = psycopg2.connect(
+    host=DB_HOST,
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASS 
+)
+cursor = conn.cursor()
+
+# Define the folder containing the pickle files
+POLYGONSCAN_FOLDER = 'C:\Bayes Business School\Database Management System\dao-data-smm695\dao-data-smm695\polygonscan-data-collection\.data'
+
+# Process the folder and import data
+process_folder(POLYGONSCAN_FOLDER, cursor)
+
+# Commit the transaction
+conn.commit()
+
+# Close the connection
+cursor.close()
+conn.close()
+
+def process_folder(data_folder, cursor):
+    for pickle_file in glob.glob(os.path.join(data_folder, '*.pickle')):
+        print(f"Processing file: {pickle_file}")  # Debugging statement
+        with open(pickle_file, 'rb') as file:
+            data = pickle.load(file)
+            parse_and_insert(data, cursor)
+            
+            # Insert address data directly
+            cursor.execute("""
+                INSERT INTO dao.Addresses (address, current_balance)
+                VALUES (%s, %s)
+                ON CONFLICT (address) DO NOTHING
+            """, (data['address'].lower(), data['current_balance']))
+
+def parse_and_insert(data, cursor):
+    def safe_convert(value, conversion_func=str):
+        return conversion_func(value) if value else None
+
+    for transfer in data.get("erc_20_token_transfer", []):
+        transfer["timeStamp"] = datetime.fromtimestamp(int(transfer["timeStamp"]))
+        transfer["from_address"] = transfer.pop("from")
+        transfer["to_address"] = transfer.pop("to")
+        cursor.execute("""
+            INSERT INTO dao.erc_20_token_transfer (blockNumber, timeStamp, hash, nonce, blockHash, from_address, contractAddress, to_address, value, tokenName, tokenSymbol, tokenDecimal, transactionIndex, gas, gasPrice, gasUsed, cumulativeGasUsed, input, confirmations)
+            VALUES (%(blockNumber)s, %(timeStamp)s, %(hash)s, %(nonce)s, %(blockHash)s, %(from_address)s, %(contractAddress)s, %(to_address)s, %(value)s, %(tokenName)s, %(tokenSymbol)s, %(tokenDecimal)s, %(transactionIndex)s, %(gas)s, %(gasPrice)s, %(gasUsed)s, %(cumulativeGasUsed)s, %(input)s, %(confirmations)s)
+            ON CONFLICT (hash) DO NOTHING
+        """, {**transfer, "nonce": safe_convert(transfer["nonce"], int), "value": safe_convert(transfer["value"], float), "transactionIndex": safe_convert(transfer["transactionIndex"], int), "gas": safe_convert(transfer["gas"], int), "gasPrice": safe_convert(transfer["gasPrice"], int), "gasUsed": safe_convert(transfer["gasUsed"], int), "cumulativeGasUsed": safe_convert(transfer["cumulativeGasUsed"], int), "confirmations": safe_convert(transfer["confirmations"], int)})
+
+    for transfer in data.get("erc721_token_transfer", []):
+        transfer["timeStamp"] = datetime.fromtimestamp(int(transfer["timeStamp"]))
+        transfer["from_address"] = transfer.pop("from")
+        transfer["to_address"] = transfer.pop("to")
+        cursor.execute("""
+            INSERT INTO dao.erc721_token_transfer (blockNumber, timeStamp, hash, nonce, blockHash, from_address, contractAddress, to_address, tokenID, tokenName, tokenSymbol, tokenDecimal, transactionIndex, gas, gasPrice, gasUsed, cumulativeGasUsed, input, confirmations)
+            VALUES (%(blockNumber)s, %(timeStamp)s, %(hash)s, %(nonce)s, %(blockHash)s, %(from_address)s, %(contractAddress)s, %(to_address)s, %(tokenID)s, %(tokenName)s, %(tokenSymbol)s, %(tokenDecimal)s, %(transactionIndex)s, %(gas)s, %(gasPrice)s, %(gasUsed)s, %(cumulativeGasUsed)s, %(input)s, %(confirmations)s)
+            ON CONFLICT (hash) DO NOTHING
+        """, {**transfer, "nonce": safe_convert(transfer["nonce"], int), "tokenID": safe_convert(transfer["tokenID"], float), "transactionIndex": safe_convert(transfer["transactionIndex"], int), "gas": safe_convert(transfer["gas"], int), "gasPrice": safe_convert(transfer["gasPrice"], int), "gasUsed": safe_convert(transfer["gasUsed"], int), "cumulativeGasUsed": safe_convert(transfer["cumulativeGasUsed"], int), "confirmations": safe_convert(transfer["confirmations"], int)})
+
+    for transaction in data.get("transactons", []):
+        transaction["timeStamp"] = datetime.fromtimestamp(int(transaction["timeStamp"]))
+        transaction["from_address"] = transaction.pop("from")
+        transaction["to_address"] = transaction.pop("to")
+        cursor.execute("""
+            INSERT INTO dao.transactions (blockNumber, timeStamp, hash, nonce, blockHash, transactionIndex, from_address, to_address, value, gas, gasPrice, isError, txreceipt_status, input, cumulativeGasUsed, gasUsed, confirmations, methodId, functionName)
+            VALUES (%(blockNumber)s, %(timeStamp)s, %(hash)s, %(nonce)s, %(blockHash)s, %(transactionIndex)s, %(from_address)s, %(to_address)s, %(value)s, %(gas)s, %(gasPrice)s, %(isError)s, %(txreceipt_status)s, %(input)s, %(cumulativeGasUsed)s, %(gasUsed)s, %(confirmations)s, %(methodId)s, %(functionName)s)
+            ON CONFLICT (hash) DO NOTHING
+        """, {**transaction, "nonce": safe_convert(transaction["nonce"], int), "transactionIndex": safe_convert(transaction["transactionIndex"], int), "value": safe_convert(transaction["value"], float), "gas": safe_convert(transaction["gas"], int), "gasPrice": safe_convert(transaction["gasPrice"], int), "isError": safe_convert(transaction["isError"], int), "txreceipt_status": safe_convert(transaction["txreceipt_status"], int), "cumulativeGasUsed": safe_convert(transaction["cumulativeGasUsed"], int), "gasUsed": safe_convert(transaction["gasUsed"], int), "confirmations": safe_convert(transaction["confirmations"], int)})
+
+# Connect to your PostgreSQL database
+conn = psycopg2.connect(
+    host=DB_HOST,
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASS 
+)
+cursor = conn.cursor()
+
+# Define the folder containing the pickle files
+POLYGONSCAN_FOLDER2 = 'C:\Bayes Business School\Database Management System\dao-data-smm695\dao-data-smm695\polygonscan-data-collection\polygonscan2'
+
+# Process the folder and import data
+process_folder(POLYGONSCAN_FOLDER2, cursor)
+
+# Commit the transaction
+conn.commit()
+
+
+# Close the connection
+cursor.close()
+conn.close()
